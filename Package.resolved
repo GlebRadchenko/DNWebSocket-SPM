@@ -1,0 +1,25 @@
+{
+  "object": {
+    "pins": [
+      {
+        "package": "CCommonCrypto",
+        "repositoryURL": "https://github.com/GlebRadchenko/CCommonCrypto.git",
+        "state": {
+          "branch": "master",
+          "revision": "a0cec609a3ffdbb2584ba11b32e4ee0795de6971",
+          "version": null
+        }
+      },
+      {
+        "package": "CZLib",
+        "repositoryURL": "https://github.com/GlebRadchenko/CZLib.git",
+        "state": {
+          "branch": "master",
+          "revision": "8e5003be0433d3eedb981ea03c7ac960b3ab40c7",
+          "version": null
+        }
+      }
+    ]
+  },
+  "version": 1
+}

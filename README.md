@@ -1,1 +1,3 @@
-DNWebSocket-SPM
+# DNWebSocket
+
+A description of this package.
