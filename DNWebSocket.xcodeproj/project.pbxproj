@@ -79,6 +79,13 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		F7A65F16202C808100F190CB /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		OBJ_21 /* Models */ = {
 			isa = PBXGroup;
 			children = (
@@ -151,6 +158,7 @@
 				OBJ_7 /* Sources */,
 				OBJ_44 /* Dependencies */,
 				OBJ_45 /* Products */,
+				F7A65F16202C808100F190CB /* Frameworks */,
 			);
 			sourceTree = "<group>";
 		};
@@ -211,6 +219,7 @@
 		OBJ_1 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
+				LastSwiftUpdateCheck = 0920;
 				LastUpgradeCheck = 9999;
 			};
 			buildConfigurationList = OBJ_2 /* Build configuration list for PBXProject "DNWebSocket" */;
