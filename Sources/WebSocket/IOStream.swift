@@ -20,7 +20,7 @@ public class IOStream: NSObject {
     deinit { disconnect() }
     
     override init() {
-        queue = DispatchQueue(label: "dialognet-websocket-io-stream-queue", qos: .default)
+        queue = DispatchQueue(label: "dialognet-websocket-io-stream-queue", qos: .userInitiated)
         super.init()
     }
     
@@ -33,7 +33,10 @@ public class IOStream: NSObject {
             try createIOPair(url: url, port: port)
             try setupNetworkServiceType(networkSystemType)
             try configureProxySetting()
+            #if os(watchOS) || os(Linux)
+            #else
             try configureSSLSettings(settings)
+            #endif
             try setupIOPair()
             
             openConnection(timeout: timeout, completion: completion)
@@ -122,7 +125,7 @@ public class IOStream: NSObject {
         case .video:
             streamNetworkServiceType = .video
         case .networkServiceTypeCallSignaling:
-            if #available(OSX 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *) {
+            if #available(iOS 10.0, OSX 10.12, watchOS 3.0, tvOS 10.0, *) {
                 streamNetworkServiceType = .callSignaling
             } else {
                 return
@@ -136,13 +139,14 @@ public class IOStream: NSObject {
     }
     
     fileprivate func configureProxySetting() throws {
+        #if os(watchOS) || os(Linux)
+            return
+        #else
         guard enableProxy else { return }
         guard let input = inputStream, let output = outputStream else {
             throw StreamError.wrongIOPair
         }
-        #if os(watchOS)
-        #else
-            
+        
         guard let proxySettings = CFNetworkCopySystemProxySettings() else { return }
         let settings = CFDictionaryCreateMutableCopy(nil, 0, proxySettings.takeRetainedValue())
         let key = CFStreamPropertyKey(rawValue: kCFStreamPropertySOCKSProxy)
@@ -152,6 +156,8 @@ public class IOStream: NSObject {
         #endif
     }
     
+    #if os(watchOS) || os(Linux)
+    #else
     fileprivate func configureSSLSettings(_ settings: SSLSettings) throws {
         guard let input = inputStream, let output = outputStream else {
             throw StreamError.wrongIOPair
@@ -160,6 +166,7 @@ public class IOStream: NSObject {
         try input.apply(settings)
         try output.apply(settings)
     }
+    #endif
     
     fileprivate func setupIOPair() throws {
         guard let input = inputStream, let output = outputStream else {

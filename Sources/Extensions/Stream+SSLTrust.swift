@@ -5,9 +5,11 @@
 //  Created by Gleb Radchenko on 2/5/18.
 //
 
-import Foundation
-#if os(watchOS)
+#if os(watchOS) || os(Linux)
 #else
+
+import Foundation
+
 extension InputStream: SSLContextRetrievable {
     var sslContext: SSLContext? {
         return CFReadStreamCopyProperty(self, CFStreamPropertyKey(rawValue: kCFStreamPropertySSLContext)) as! SSLContext?
@@ -42,5 +44,5 @@ extension OutputStream: SSLContextRetrievable {
         }
     }
 }
-#endif
 
+#endif

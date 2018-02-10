@@ -5,6 +5,9 @@
 //  Created by Gleb Radchenko on 2/6/18.
 //
 
+#if os(watchOS) || os(Linux)
+#else
+
 import Foundation
 
 extension Stream {
@@ -13,10 +16,8 @@ extension Stream {
         
         let sslSettings = settings.cfSettings()
         setProperty(StreamSocketSecurityLevel.negotiatedSSL as AnyObject, forKey: .socketSecurityLevelKey)
-        #if os(watchOS)
-        #else
         setProperty(sslSettings, forKey: Stream.PropertyKey(kCFStreamPropertySSLSettings as String))
-        #endif
+        
         guard !settings.cipherSuites.isEmpty else { return }
         guard let sslContext = (self as? SSLContextRetrievable)?.sslContext else { return }
         let suites = settings.cipherSuites
@@ -26,3 +27,4 @@ extension Stream {
     }
 }
 
+#endif

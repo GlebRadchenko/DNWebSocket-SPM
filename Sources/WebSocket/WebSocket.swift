@@ -10,23 +10,23 @@ import Foundation
 open class WebSocket {
     public static let GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     
-    public fileprivate(set) var queue: DispatchQueue
     public fileprivate(set) var stream: IOStream
-    
     public fileprivate(set) var url: URL
     public fileprivate(set) var request: URLRequest
     public fileprivate(set) var protocols: [String]
     public fileprivate(set) var certificatesValidated = false
     
+    fileprivate var queue = DispatchQueue(label: "dialognet-websocket-queue", qos: .default, attributes: .concurrent)
     fileprivate var compressionSettings: CompressionSettings = .default
     fileprivate var inputStreamBuffer = StreamBuffer()
     fileprivate let operationQueue: OperationQueue
     fileprivate var currentInputFrame: Frame?
     fileprivate var secKey = ""
     
-    fileprivate var _status: WebSocketStatus = .disconnected
+    fileprivate var closingStatus: ClosingStatus = .none
+    fileprivate var _status: Status = .disconnected
     fileprivate var statusLock = NSLock()
-    public fileprivate(set) var status: WebSocketStatus {
+    public fileprivate(set) var status: Status {
         get {
             statusLock.lock(); defer { statusLock.unlock() }
             let status = _status
@@ -40,21 +40,20 @@ open class WebSocket {
         }
     }
     
-    public var timeout: TimeInterval
-    public var useCompression = true
-    public var maskOutputData: Bool = true
-    public var respondPingRequestsAutomatically = true
+    //MARK: - Settings
+    public var settings: Settings = Settings()
     public var securitySettings: SSLSettings
     public var securityValidator: SSLValidator
     
     //MARK: - Callbacks
-    public var onEvent: ((WebSocketEvent) -> Void)?
+    public var onEvent: ((Event) -> Void)?
     public var onConnect: (() -> Void)?
     public var onText: ((String) -> Void)?
     public var onData: ((Data) -> Void)?
     public var onPong: ((Data) -> Void)?
     public var onPing: ((Data) -> Void)?
     public var onDisconnect: ((Error?, CloseCode) -> Void)?
+    public var onDebugInfo: ((String) -> Void)?
     
     //MARK: - Public methods
     deinit { tearDown(reasonError: nil, code: .normalClosure) }
@@ -62,26 +61,27 @@ open class WebSocket {
     public convenience init(url: URL,
                             timeout: TimeInterval = 5,
                             protocols: [String] = [],
-                            queue: DispatchQueue = .main,
-                            processingQoS: QualityOfService = .default) {
+                            callbackQueue: DispatchQueue? = nil,
+                            processingQoS: QualityOfService = .userInteractive) {
         
         let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
-        self.init(request: request, timeout: timeout, protocols: protocols, queue: queue, processingQoS: processingQoS)
+        self.init(request: request, timeout: timeout, protocols: protocols, callbackQueue: callbackQueue, processingQoS: processingQoS)
     }
     
     public init(request: URLRequest,
                 timeout: TimeInterval = 5,
                 protocols: [String] = [],
-                queue: DispatchQueue = .main,
+                callbackQueue: DispatchQueue? = nil,
                 processingQoS: QualityOfService = .default) {
         
-        self.queue = queue
         self.stream = IOStream()
         
         self.url = request.url!
         self.request = request
-        self.timeout = timeout
         self.protocols = protocols
+        
+        settings.callbackQueue = callbackQueue
+        settings.timeout = timeout
         
         operationQueue = OperationQueue(qos: processingQoS)
         securitySettings = SSLSettings(useSSL: url.sslSupported)
@@ -93,11 +93,10 @@ open class WebSocket {
         status = .connecting
         
         secKey = String.generateSecKey()
-        request.prepare(secKey: secKey, url: url, useCompression: useCompression, protocols: protocols)
+        request.prepare(secKey: secKey, url: url, useCompression: settings.useCompression, protocols: protocols)
         
         let port = uint(url.webSocketPort)
-        
-        openConnecttion(port: port, msTimeout: timeout * 1000) { [weak self] (result) in
+        openConnecttion(port: port, msTimeout: settings.timeout * 1000) { [weak self] (result) in
             guard let wSelf = self else { return }
             result.onNegative { wSelf.tearDown(reasonError: $0, code: .noStatusReceived) }
             result.onPositive { wSelf.handleSuccessConnection() }
@@ -105,10 +104,13 @@ open class WebSocket {
     }
     
     open func disconnect() {
-        disconnect(timeout)
+        disconnect(settings.timeout)
     }
     
     open func disconnect(_ timeout: TimeInterval) {
+        guard closingStatus == .none else { return }
+        
+        closingStatus = .closingByClient
         closeConnection(timeout: timeout, code: .normalClosure)
     }
     
@@ -128,6 +130,10 @@ open class WebSocket {
     open func sendPong(data: Data, completion: (() -> Void)? = nil) {
         performSend(data: data, code: .pongFrame, completion: completion)
     }
+    
+    open func send(payload: Data, opCode: Opcode, completion: (() -> Void)? = nil) {
+        performSend(data: payload, code: opCode, completion: completion)
+    }
 }
 
 //MARK: - Lifecycle
@@ -143,6 +149,7 @@ extension WebSocket {
     }
     
     fileprivate func handleSuccessConnection() {
+        log("Connection opened")
         let operation = BlockOperation()
         operation.addExecutionBlock { [weak self, weak operation] in
             guard let wSelf = self else { return }
@@ -160,7 +167,7 @@ extension WebSocket {
     }
     
     fileprivate func validateCertificates() throws {
-        #if os(watchOS)
+        #if os(watchOS) || os(Linux)
         #else
         if securitySettings.useSSL, !certificatesValidated {
             let domain = stream.outputStream?.domain
@@ -177,6 +184,7 @@ extension WebSocket {
     
     fileprivate func performHandshake() throws {
         let rawHandshake = request.webSocketHandshake()
+        log("Sending Handshake", message: rawHandshake)
         guard let data = rawHandshake.data(using: .utf8) else {
             throw WebSocketError.handshakeFailed(response: rawHandshake)
         }
@@ -184,24 +192,30 @@ extension WebSocket {
         try stream.write(data)
     }
     
+    fileprivate func closeConnection(code: CloseCode) {
+        closeConnection(timeout: settings.timeout, code: code)
+    }
+    
     fileprivate func closeConnection(timeout: TimeInterval, code: CloseCode) {
         guard status != .disconnected else { return }
+        log("Closing connection", message: "CloseCode: \(code)")
         
         var value = code.rawValue.bigEndian
         let data = Data(bytes: &value, count: Int(UInt16.memoryLayoutSize))
         
         performSend(data: data, code: .connectionCloseFrame, completion: nil)
+        
         status = .disconnecting
         checkStatus(.disconnected, msTimeout: timeout * 1000)
     }
     
-    fileprivate func checkStatus(_ status: WebSocketStatus, msTimeout: TimeInterval, delay: Int = 100) {
-        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+    fileprivate func checkStatus(_ status: Status, msTimeout: TimeInterval, delay: Int = 100) {
+        queue.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
             guard let wSelf = self else { return }
             
             if msTimeout < Double(delay) {
                 wSelf.tearDown(reasonError: WebSocketError.timeout, code: .noStatusReceived)
-            } else {
+            } else if wSelf.status != status {
                 wSelf.checkStatus(status, msTimeout: msTimeout - TimeInterval(delay))
             }
         }
@@ -211,23 +225,34 @@ extension WebSocket {
         guard status != .disconnected else { return }
         
         status = .disconnecting
-        reasonError == nil
+        
+        reasonError.isNil
             ? operationQueue.waitUntilAllOperationsAreFinished()
             : operationQueue.cancelAllOperations()
-        
+            
         stream.disconnect()
-        inputStreamBuffer.reset()
+        inputStreamBuffer.clearBuffer()
         
         status = .disconnected
-        
         handleEvent(.disconnected(reasonError, code))
+        
+        let errorMessage = reasonError.isNil ? "No error." : "Error: \(reasonError!.localizedDescription)"
+        log("Connection closed", message: "CloseCode: \(code). " + errorMessage)
     }
 }
 
 //MARK: - Event Handling
 extension WebSocket {
-    fileprivate func handleEvent(_ event: WebSocketEvent) {
-        queue.async { [weak self] in
+    fileprivate func log(_ event: String, message: String = "") {
+        if settings.debugMode {
+            let header = "\n**** \(event.uppercased()) ****\n"
+            let date = Date().iso8601ms + "\n"
+            handleEvent(.debug(header + date + message))
+        }
+    }
+    
+    fileprivate func handleEvent(_ event: Event) {
+        let notifyBlock = { [weak self] in
             guard let wSelf = self else { return }
             
             wSelf.onEvent?(event)
@@ -244,7 +269,15 @@ extension WebSocket {
                 wSelf.onPong?(data)
             case let .disconnected(error, code):
                 wSelf.onDisconnect?(error, code)
+            case let .debug(info):
+                wSelf.onDebugInfo?(info)
             }
+        }
+        
+        if let callbackQueue = settings.callbackQueue {
+            callbackQueue.async(execute: notifyBlock)
+        } else {
+            notifyBlock()
         }
     }
 }
@@ -255,12 +288,7 @@ extension WebSocket {
         return { [weak self] (event, type) in
             guard let wSelf = self else { return }
             
-            switch type {
-            case .input:
-                wSelf.handleInputEvent(event)
-            case .output:
-                wSelf.handleOutputEvent(event)
-            }
+            type == .input ? wSelf.handleInputEvent(event) : wSelf.handleOutputEvent(event)
         }
     }
     
@@ -272,7 +300,10 @@ extension WebSocket {
         case .hasBytesAvailable:
             handleInputBytesAvailable()
         case .endEncountered:
-            tearDown(reasonError: stream.inputStream?.streamError, code: .abnormalClosure)
+            let closeCode: CloseCode = (status == .disconnecting || status == .disconnected)
+                ? .normalClosure
+                : .abnormalClosure
+            tearDown(reasonError: stream.inputStream?.streamError, code: closeCode)
         case .errorOccurred:
             handleInputError()
         }
@@ -284,41 +315,34 @@ extension WebSocket {
     }
     
     fileprivate func handleInputBytesAvailable() {
+        log("New bytes available")
         do {
             let data = try stream.read()
             inputStreamBuffer.enqueue(data)
-            
-            if inputStreamBuffer.shouldBeProcessed {
-                processInputStreamData()
-            }
+            processInputStreamData()
         } catch {
             tearDown(reasonError: error, code: .abnormalClosure)
         }
     }
     
     fileprivate func processInputStreamData() {
-        while !inputStreamBuffer.isEmpty {
-            inputStreamBuffer.dequeueIntoBuffer()
-            processInputBufferData()
-        }
+        while inputStreamBuffer.buffer.count >= 2 && processInputBufferData() { }
     }
     
-    fileprivate func processInputBufferData() {
-        let data = inputStreamBuffer.buffer
-        
-        switch status {
-        case .connecting:
-            guard let handshake = Handshake(data: data) else { return }
+    fileprivate func processInputBufferData() -> Bool {
+        if status == .connecting {
+            guard let handshake = Handshake(data: inputStreamBuffer.buffer) else { return false }
             inputStreamBuffer.clearBuffer()
             
-            do {
-                try processHandshake(handshake)
-            } catch {
-                tearDown(reasonError: error, code: .TLSHandshake)
-            }
-        default:
-            processData(data)
+            log("Handshake received", message: handshake.rawBodyString)
+            do { try processHandshake(handshake) }
+            catch { tearDown(reasonError: error, code: .TLSHandshake) }
         }
+        
+        let data = inputStreamBuffer.buffer
+        guard data.count >= 2 else { return false }
+        inputStreamBuffer.clearBuffer()
+        return processData(data)
     }
     
     fileprivate func processHandshake(_ handshake: Handshake) throws {
@@ -330,9 +354,6 @@ extension WebSocket {
         guard handshake.code == .switching else {
             throw WebSocketError.handshakeFailed(response: handshake.rawBodyString)
         }
-        
-        status = .connected
-        handleEvent(.connected)
         
         guard let acceptKey = handshake.httpHeaders[Header.accept.lowercased()] else {
             throw WebSocketError.missingHeader(header: Header.accept)
@@ -346,40 +367,41 @@ extension WebSocket {
         if let extensions = handshake.httpHeaders[Header.secExtension.lowercased()] {
             compressionSettings.update(with: extensions)
         }
+        
+        log("Handshake successed")
+        status = .connected
+        handleEvent(.connected)
     }
     
-    fileprivate func processData(_ data: Data) {
+    fileprivate func processData(_ data: Data) -> Bool {
         let unsafeBuffer = data.unsafeBuffer()
-        var shouldRestoreBuffer = true
+        var successed = false
         
-        if let (frame, usedAmount) = Frame.decode(from: unsafeBuffer) {
+        if let (frame, usedAmount) = Frame.decode(from: unsafeBuffer), frame.isFullfilled {
             inputStreamBuffer.clearBuffer()
             if usedAmount < data.count {
                 inputStreamBuffer.buffer = Data(unsafeBuffer[usedAmount..<data.count])
             }
             
-            let success = processFrame(frame)
-            shouldRestoreBuffer = !success
+            successed = processFrame(frame)
         }
         
-        if shouldRestoreBuffer {
+        if !successed {
             inputStreamBuffer.buffer = data
         }
+        
+        return successed
     }
     
     fileprivate func processFrame(_ frame: Frame) -> Bool {
+        log("Frame received", message: frame.description)
         if frame.opCode == .unknown {
-            closeConnection(timeout: timeout, code: .unsupportedData)
+            tearDown(reasonError: nil, code: .protocolError)
             return false
         }
         
-        guard frame.isFullfilled else {
-            //received not full frame
-            return false
-        }
-        
-        if frame.isControlFrame && !frame.fin {
-            closeConnection(timeout: timeout, code: .protocolError)
+        if frame.rsv, !compressionSettings.useCompression {
+            closeConnection(code: .protocolError)
             return false
         }
         
@@ -400,26 +422,46 @@ extension WebSocket {
     }
     
     fileprivate func processControlFrame(_ frame: Frame) -> Bool {
+        guard frame.fin, frame.payloadLength <= 125 else {
+            closeConnection(code: .protocolError)
+            return false
+        }
+        
         switch frame.opCode {
         case .pingFrame:
             handleEvent(.pingReceived(frame.payload))
-            if respondPingRequestsAutomatically {
+            if settings.respondPingRequestsAutomatically {
                 sendPong(data: frame.payload)
             }
         case .pongFrame:
             do {
                 try decompressFrameIfNeeded(frame)
             } catch {
-                closeConnection(timeout: timeout, code: .invalidFramePayloadData)
+                closeConnection(code: .invalidFramePayloadData)
                 return false
             }
             
             handleEvent(.pongReceived(frame.payload))
         case .connectionCloseFrame:
-            let closeCode = frame.closeCode() ?? .protocolError
-            status == .disconnecting
-                ? tearDown(reasonError: nil, code: closeCode)
-                : closeConnection(timeout: timeout, code: closeCode)
+            switch closingStatus {
+            case .none:
+                closingStatus = .closingByServer
+                if checkCloseFramePayload(frame) {
+                    if let closeCode = frame.closeCode() {
+                        processCloseFrameCode(closeCode)
+                    } else {
+                        closeConnection(code: .protocolError)
+                    }
+                } else {
+                    closeConnection(code: .invalidFramePayloadData)
+                }
+                break
+            case .closingByClient:
+                tearDown(reasonError: nil, code: frame.closeCode() ?? .protocolError)
+            case .closingByServer:
+                //Just ignore
+                return true
+            }
         default:
             return false
         }
@@ -427,35 +469,51 @@ extension WebSocket {
         return true
     }
     
+    fileprivate func checkCloseFramePayload(_ frame: Frame) -> Bool {
+        guard frame.opCode == .connectionCloseFrame else { return false }
+        guard frame.payloadLength > 2 else { return true } // Only code
+        
+        return frame.closeInfo().isNotNil
+    }
+    
+    fileprivate func processCloseFrameCode(_ code: CloseCode) {
+        switch code {
+        case .noStatusReceived, .abnormalClosure, .TLSHandshake:
+            closeConnection(code: .protocolError)
+        default:
+            closeConnection(code: .normalClosure)
+        }
+    }
+    
     fileprivate func processDataFrame(_ frame: Frame) -> Bool {
         if frame.opCode == .continuationFrame {
             return processContinuationFrame(frame)
         }
         
+        if currentInputFrame.isNotNil {
+            //Received new Data frame when not fullfill current fragmented yet
+            closeConnection(code: .protocolError)
+            return false
+        }
+        
+        if frame.rsv && !compressionSettings.useCompression {
+            closeConnection(code: .protocolError)
+            return false
+        }
+        
         if frame.fin {
-            do {
-                try decompressFrameIfNeeded(frame)
-            } catch {
-                closeConnection(timeout: timeout, code: .invalidFramePayloadData)
-                return false
-            }
+            do { try decompressFrameIfNeeded(frame) }
+            catch { closeConnection(code: .invalidFramePayloadData); return false }
             
             if frame.opCode == .binaryFrame {
                 handleEvent(.dataReceived(frame.payload))
-            } else if frame.opCode == .textFrame {
-                guard let text = String(data: frame.payload, encoding: .utf8) else {
-                    closeConnection(timeout: timeout, code: .invalidFramePayloadData)
-                    return false
-                }
-                
+            } else if frame.opCode == .textFrame, let text = String(data: frame.payload, encoding: .utf8) {
                 handleEvent(.textReceived(text))
-            }
-        } else {
-            guard frame.opCode != .continuationFrame else {
-                closeConnection(timeout: timeout, code: .protocolError)
+            } else {
+                closeConnection(code: .invalidFramePayloadData)
                 return false
             }
-            
+        } else {
             currentInputFrame = frame
         }
         
@@ -464,7 +522,7 @@ extension WebSocket {
     
     fileprivate func processContinuationFrame(_ frame: Frame) -> Bool {
         guard let inputFrame = currentInputFrame else {
-            closeConnection(timeout: timeout, code: .protocolError)
+            closeConnection(code: .protocolError)
             return false
         }
         
@@ -472,7 +530,7 @@ extension WebSocket {
         
         if inputFrame.fin {
             currentInputFrame = nil
-            return processFrame(frame)
+            return processFrame(inputFrame)
         }
         
         return true
@@ -514,23 +572,32 @@ extension WebSocket {
             let frame = wSelf.prepareFrame(payload: data, opCode: code)
             let frameData = Frame.encode(frame)
             let frameSize = frameData.count
+            frame.frameSize = UInt64(frameSize)
             
             let buffer = frameData.unsafeBuffer()
             var totalBytesWritten = 0
             
-            while totalBytesWritten < frameSize && !wOperation.isCancelled && wSelf.status == .connected {
+            wSelf.log("Sending Frame", message: frame.description)
+            while totalBytesWritten < frameSize && !wOperation.isCancelled {
                 do {
                     let dataToWrite = Data(buffer[totalBytesWritten..<frameSize])
                     let dataWritten = try wSelf.stream.write(dataToWrite)
                     totalBytesWritten += dataWritten
                 } catch {
-                    wSelf.tearDown(reasonError: error, code: .unsupportedData)
+                    if wSelf.status == .connected {
+                        wSelf.tearDown(reasonError: error, code: .unsupportedData)
+                    }
                     return
                 }
             }
             
-            wSelf.queue.async {
-                completion?()
+            wSelf.log("Sent")
+            guard let completion = completion else { return }
+            
+            if let callbackQueue = wSelf.settings.callbackQueue {
+                callbackQueue.async(execute: completion)
+            } else {
+                completion()
             }
         }
         
@@ -541,12 +608,15 @@ extension WebSocket {
         var payload = payload
         
         let frame = Frame(fin: true, opCode: opCode)
-        frame.rsv1 = compressionSettings.useCompression
-        frame.isMasked = maskOutputData
-        frame.mask = Data.randomMask()
+        
+        if settings.maskOutputData {
+            frame.isMasked = true
+            frame.mask = Data.randomMask()
+        }
         
         if compressionSettings.useCompression {
             do {
+                frame.rsv1 = true
                 frame.payload = try payload.compress(windowBits:compressionSettings.clientMaxWindowBits)
                 frame.payload.removeTail()
             } catch {
