@@ -374,19 +374,26 @@ extension WebSocket {
     }
     
     fileprivate func processData(_ data: Data) -> Bool {
+        var data = data
         let unsafeBuffer = data.unsafeBuffer()
-        var successed = false
         
-        if let (frame, usedAmount) = Frame.decode(from: unsafeBuffer), frame.isFullfilled {
-            inputStreamBuffer.clearBuffer()
-            if usedAmount < data.count {
-                inputStreamBuffer.buffer = Data(unsafeBuffer[usedAmount..<data.count])
+        var offset = 0
+        var successed = true
+        
+        while offset + 2 <= unsafeBuffer.count {
+            if let (frame, newOffset) = Frame.decode(from: unsafeBuffer, fromOffset: offset) {
+                if frame.isFullfilled, processFrame(frame) {
+                    offset = newOffset
+                    continue
+                } else {
+                    successed = false
+                    break
+                }
             }
-            
-            successed = processFrame(frame)
         }
         
-        if !successed {
+        if offset < unsafeBuffer.count {
+            data.removeFirst(offset)
             inputStreamBuffer.buffer = data
         }
         
@@ -406,7 +413,7 @@ extension WebSocket {
         }
         
         if frame.isMasked && frame.fin {
-            frame.payload = frame.payload.unmasked(with: frame.mask)
+            frame.payload.unmask(with: frame.mask)
         }
         
         if frame.isControlFrame {
@@ -537,10 +544,15 @@ extension WebSocket {
     }
     
     fileprivate func decompressFrameIfNeeded(_ frame: Frame) throws {
-        if compressionSettings.useCompression && frame.rsv1 {
-            frame.payload.addTail()
-            let data = try frame.payload.decompress(windowBits: compressionSettings.serverMaxWindowBits)
-            handleEvent(.pongReceived(data))
+        guard let inflater = compressionSettings.inflater else { return }
+        guard compressionSettings.useCompression && frame.rsv1 else { return }
+        
+        frame.payload.addTail()
+        let decompressedPayload = try inflater.decompress(windowBits: compressionSettings.serverMaxWindowBits, data: frame.payload)
+        frame.payload = decompressedPayload
+        
+        if compressionSettings.serverNoContextTakeover {
+            inflater.reset()
         }
     }
     
@@ -575,20 +587,23 @@ extension WebSocket {
             frame.frameSize = UInt64(frameSize)
             
             let buffer = frameData.unsafeBuffer()
-            var totalBytesWritten = 0
+            var bytesWritten = 0
+            var streamError: Error?
             
-            wSelf.log("Sending Frame", message: frame.description)
-            while totalBytesWritten < frameSize && !wOperation.isCancelled {
+            while bytesWritten < frameSize && !wOperation.isCancelled && streamError.isNil {
+                let pointer = buffer.baseAddress!.advanced(by: bytesWritten)
                 do {
-                    let dataToWrite = Data(buffer[totalBytesWritten..<frameSize])
-                    let dataWritten = try wSelf.stream.write(dataToWrite)
-                    totalBytesWritten += dataWritten
+                    let writtenCount = try wSelf.stream.write(pointer, count: buffer.count - bytesWritten)
+                    bytesWritten += writtenCount
                 } catch {
-                    if wSelf.status == .connected {
-                        wSelf.tearDown(reasonError: error, code: .unsupportedData)
-                    }
-                    return
+                    streamError = error
+                    break
                 }
+            }
+            
+            if let error = streamError, wSelf.status == .connected {
+                wSelf.tearDown(reasonError: error, code: .unsupportedData)
+                return
             }
             
             wSelf.log("Sent")
@@ -605,32 +620,34 @@ extension WebSocket {
     }
     
     fileprivate func prepareFrame(payload: Data, opCode: Opcode) -> Frame {
-        var payload = payload
-        
         let frame = Frame(fin: true, opCode: opCode)
+        frame.payload = payload
         
         if settings.maskOutputData {
             frame.isMasked = true
             frame.mask = Data.randomMask()
         }
         
-        if compressionSettings.useCompression {
+        if compressionSettings.useCompression, let deflater = compressionSettings.deflater {
             do {
                 frame.rsv1 = true
-                frame.payload = try payload.compress(windowBits:compressionSettings.clientMaxWindowBits)
+                let compressedPayload = try deflater.compress(windowBits: compressionSettings.clientMaxWindowBits,
+                                                              data: frame.payload)
+                frame.payload = compressedPayload
                 frame.payload.removeTail()
+                
+                if compressionSettings.clientNoContextTakeover {
+                    deflater.reset()
+                }
             } catch {
                 //Temporary solution
                 debugPrint(error.localizedDescription)
-                frame.payload = payload
                 frame.rsv1 = false
             }
-        } else {
-            frame.payload = payload
         }
         
         if frame.isMasked {
-            frame.payload = frame.payload.masked(with: frame.mask)
+            frame.payload.mask(with: frame.mask)
         }
         
         frame.payloadLength = UInt64(frame.payload.count)
